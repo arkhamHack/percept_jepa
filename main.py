@@ -1,4 +1,4 @@
-"""Entry point for radar-camera fusion JEPA pipeline.
+"""Entry point for multimodal perception pipeline.
 
 Usage:
     python main.py --mode train   --config configs/default.yaml
@@ -18,7 +18,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import NuScenesRadarCameraDataset, collate_fn
-from models import JEPAModel
+from models import MultimodalPerceptionModel, JEPAModel
 from training import Trainer
 
 
@@ -27,21 +27,35 @@ def load_config(path: str) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def build_model(cfg: dict[str, Any]) -> JEPAModel:
+def build_model(cfg: dict[str, Any]) -> torch.nn.Module:
     mc = cfg["model"]
-    return JEPAModel(
-        pretrained=mc.get("pretrained", True),
-        light=mc.get("light_backbone", False),
-        image_feat_dim=mc.get("image_feat_dim", 512),
-        radar_dim=mc.get("radar_dim", 128),
-        latent_dim=mc.get("latent_dim", 256),
-        max_objects=mc.get("max_objects", 50),
-        num_modes=mc.get("num_modes", 5),
-        pred_steps=mc.get("pred_steps", 12),
-        agent_state_dim=mc.get("agent_state_dim", 3),
-        decoder_heads=mc.get("decoder_heads", 8),
-        decoder_layers=mc.get("decoder_layers", 2),
-    )
+    model_type = mc.get("type", "multimodal_vjepa")
+
+    if model_type == "multimodal_vjepa":
+        return MultimodalPerceptionModel(
+            vjepa_cfg=mc.get("vjepa", {}),
+            radar_cfg=mc.get("radar", {}),
+            fusion_cfg=mc.get("fusion", {}),
+            detection_cfg=mc.get("detection", {}),
+            velocity_cfg=mc.get("velocity", {}),
+            tracking_cfg=mc.get("tracking", {}),
+            bev_cfg=cfg.get("bev", {}),
+        )
+    else:
+        # Legacy JEPA model
+        return JEPAModel(
+            pretrained=mc.get("pretrained", True),
+            light=mc.get("light_backbone", False),
+            image_feat_dim=mc.get("image_feat_dim", 512),
+            radar_dim=mc.get("radar_dim", 128),
+            latent_dim=mc.get("latent_dim", 256),
+            max_objects=mc.get("max_objects", 50),
+            num_modes=mc.get("num_modes", 5),
+            pred_steps=mc.get("pred_steps", 12),
+            agent_state_dim=mc.get("agent_state_dim", 3),
+            decoder_heads=mc.get("decoder_heads", 8),
+            decoder_layers=mc.get("decoder_layers", 2),
+        )
 
 
 def build_dataloaders(
@@ -85,9 +99,19 @@ def build_optimizer_scheduler(
     tc = cfg["training"]
     sc = cfg.get("scheduler", {})
 
+    # Staged training: separate param groups for backbone vs rest
+    if hasattr(model, "get_backbone_params"):
+        backbone_lr = tc.get("lr", 3e-4) * tc.get("backbone_lr_scale", 0.1)
+        param_groups = [
+            {"params": model.get_non_backbone_params(), "lr": tc.get("lr", 3e-4)},
+            {"params": [p for p in model.get_backbone_params() if p.requires_grad],
+             "lr": backbone_lr},
+        ]
+    else:
+        param_groups = [{"params": model.parameters(), "lr": tc.get("lr", 3e-4)}]
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=tc.get("lr", 3e-4),
+        param_groups,
         weight_decay=tc.get("weight_decay", 1e-4),
     )
 
@@ -114,6 +138,16 @@ def build_optimizer_scheduler(
 
 def run_train(cfg: dict[str, Any]) -> None:
     model = build_model(cfg)
+
+    # Set training stage for multimodal model
+    tc = cfg["training"]
+    stage = tc.get("stage", 1)
+    if hasattr(model, "set_training_stage"):
+        unfreeze_n = cfg["model"].get("vjepa", {}).get("unfreeze_last_n", 4)
+        model.set_training_stage(stage, unfreeze_n)
+        print(f"[main] Training stage {stage}" +
+              (f" (unfreezing last {unfreeze_n} V-JEPA blocks)" if stage >= 2 else " (V-JEPA frozen)"))
+
     loaders = build_dataloaders(cfg, splits=["train", "val"])
     optimizer, scheduler = build_optimizer_scheduler(model, cfg)
 

@@ -1,14 +1,14 @@
-"""NuScenes radar-camera fusion dataset for JEPA pre-training and evaluation.
+"""NuScenes radar-camera dataset for multimodal perception training.
 
-Supports both **detection** and **prediction** tasks:
-  - Detection: 2D boxes + velocity labels (per frame)
-  - Prediction: per-agent future trajectories + agent state vectors,
-    compatible with the nuScenes prediction challenge format.
+Supports both spatial (anchor-free) and per-object output formats:
+  - Spatial: heatmaps, box regression maps, velocity maps for anchor-free heads
+  - Per-object: 2D boxes, velocities, trajectories for legacy JEPA heads
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -30,13 +30,12 @@ logger = logging.getLogger(__name__)
 _RADAR_XYZ = [0, 1, 2]
 _RADAR_VEL = [8, 9]
 _RADAR_RCS = [5]
-_RADAR_FEAT_IDX = _RADAR_XYZ + _RADAR_VEL + _RADAR_RCS  # length 6
+_RADAR_FEAT_IDX = _RADAR_XYZ + _RADAR_VEL + _RADAR_RCS
 _RADAR_FEAT_DIM = len(_RADAR_FEAT_IDX)
 
 _FRONT_CAM = "CAM_FRONT"
 _FRONT_RADAR = "RADAR_FRONT"
-
-_AGENT_STATE_DIM = 3  # velocity, acceleration, heading_change_rate
+_AGENT_STATE_DIM = 3
 
 
 class NuScenesRadarCameraDataset(Dataset):
@@ -340,6 +339,74 @@ class NuScenesRadarCameraDataset(Dataset):
         return boxes_2d, velocities, len(boxes_2d_list), ann_tokens_used
 
     # ------------------------------------------------------------------
+    # Spatial ground truth for anchor-free heads
+    # ------------------------------------------------------------------
+
+    def _generate_spatial_targets(
+        self,
+        boxes_2d: torch.Tensor,
+        velocities: torch.Tensor,
+        num_objects: int,
+        feat_h: int = 14,
+        feat_w: int = 14,
+    ) -> dict[str, torch.Tensor]:
+        """Generate heatmap, box regression, and velocity maps for anchor-free heads.
+
+        Args:
+            boxes_2d: ``(N, 4)`` normalised ``[x1, y1, x2, y2]``.
+            velocities: ``(N, 2)`` per-object ``(vx, vy)``.
+            num_objects: Number of valid objects.
+            feat_h, feat_w: Spatial size of feature map output.
+
+        Returns:
+            Dict with ``gt_heatmap``, ``gt_box_reg``, ``gt_velocity_map``, ``pos_mask``.
+        """
+        heatmap = torch.zeros(1, feat_h, feat_w)
+        box_reg = torch.zeros(4, feat_h, feat_w)
+        vel_map = torch.zeros(2, feat_h, feat_w)
+        pos_mask = torch.zeros(1, feat_h, feat_w)
+
+        for i in range(num_objects):
+            x1, y1, x2, y2 = boxes_2d[i].tolist()
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            w = x2 - x1
+            h = y2 - y1
+
+            # Map to feature grid
+            gx = int(cx * feat_w)
+            gy = int(cy * feat_h)
+            gx = min(max(gx, 0), feat_w - 1)
+            gy = min(max(gy, 0), feat_h - 1)
+
+            # Gaussian heatmap
+            radius = max(1, int(min(w * feat_w, h * feat_h) / 2))
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    py, px = gy + dy, gx + dx
+                    if 0 <= py < feat_h and 0 <= px < feat_w:
+                        d2 = dx * dx + dy * dy
+                        sigma2 = max(radius * radius / 4, 0.5)
+                        val = math.exp(-d2 / (2 * sigma2))
+                        heatmap[0, py, px] = max(heatmap[0, py, px], val)
+
+            # At center cell: box offsets and velocity
+            pos_mask[0, gy, gx] = 1.0
+            box_reg[0, gy, gx] = cx - gx / feat_w  # dx offset
+            box_reg[1, gy, gx] = cy - gy / feat_h  # dy offset
+            box_reg[2, gy, gx] = w
+            box_reg[3, gy, gx] = h
+            vel_map[0, gy, gx] = velocities[i, 0].item()
+            vel_map[1, gy, gx] = velocities[i, 1].item()
+
+        return {
+            "gt_heatmap": heatmap,
+            "gt_box_reg": box_reg,
+            "gt_velocity_map": vel_map,
+            "pos_mask": pos_mask,
+        }
+
+    # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
 
@@ -371,6 +438,11 @@ class NuScenesRadarCameraDataset(Dataset):
             self._get_agent_prediction_data(sample, ann_tokens_used)
         )
 
+        # Spatial targets for anchor-free heads (14x14 matches ViT-B/16 @ 224)
+        spatial_targets = self._generate_spatial_targets(
+            boxes_2d, velocity, num_objects, feat_h=14, feat_w=14,
+        )
+
         out: dict[str, Any] = {
             "image": image,
             "radar_points": radar_points,
@@ -384,6 +456,7 @@ class NuScenesRadarCameraDataset(Dataset):
             "agent_states": agent_states,
             "instance_tokens": instance_tokens,
             "sample_token": sample["token"],
+            **spatial_targets,
         }
 
         if self.use_future_frame:
@@ -451,5 +524,10 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         out["future_image"] = torch.stack(
             [item["future_image"] for item in batch]
         )
+
+    # Spatial targets for anchor-free heads
+    for key in ("gt_heatmap", "gt_box_reg", "gt_velocity_map", "pos_mask"):
+        if key in first:
+            out[key] = torch.stack([item[key] for item in batch])
 
     return out

@@ -35,7 +35,7 @@ class RealtimeInference:
     def __init__(
         self,
         model: nn.Module,
-        image_size: tuple[int, int] = (448, 800),
+        image_size: tuple[int, int] = (224, 224),
         confidence_threshold: float = 0.3,
         show_velocity: bool = True,
         device: str = "cuda",
@@ -45,6 +45,7 @@ class RealtimeInference:
         self.image_size = image_size
         self.conf_thr = confidence_threshold
         self.show_velocity = show_velocity
+        self.is_multimodal = hasattr(model, "set_training_stage")
 
     # ──────────────────────────────────────────────────────────
     #  Video loop
@@ -159,13 +160,66 @@ class RealtimeInference:
 
     def _forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         with torch.amp.autocast("cuda", enabled=self.device.type == "cuda"):
-            return self.model(
-                image=batch["image"],
-                radar_points=batch["radar_points"],
-                radar_mask=batch["radar_mask"],
-                future_image=batch.get("future_image"),
-                agent_states=batch.get("agent_states"),
-            )
+            if self.is_multimodal:
+                outputs = self.model(
+                    image=batch["image"],
+                    radar_points=batch["radar_points"],
+                    radar_mask=batch["radar_mask"],
+                )
+                # Convert spatial outputs to per-object format for drawing
+                return self._spatial_to_objects(outputs, batch["image"].shape)
+            else:
+                return self.model(
+                    image=batch["image"],
+                    radar_points=batch["radar_points"],
+                    radar_mask=batch["radar_mask"],
+                    future_image=batch.get("future_image"),
+                    agent_states=batch.get("agent_states"),
+                )
+
+    def _spatial_to_objects(
+        self, outputs: dict[str, torch.Tensor], img_shape: tuple,
+    ) -> dict[str, torch.Tensor]:
+        """Convert anchor-free spatial outputs to per-object boxes + velocity."""
+        heatmap = outputs["heatmap"].sigmoid()  # (B, 1, H, W)
+        box_reg = outputs["box_reg"]            # (B, 4, H, W)
+        vel = outputs["velocity"]               # (B, 2, H, W)
+
+        B, _, H, W = heatmap.shape
+
+        # Flatten and get top-K detections
+        scores_flat = heatmap.view(B, -1)  # (B, H*W)
+        K = min(50, scores_flat.shape[1])
+        topk_scores, topk_idx = scores_flat.topk(K, dim=1)  # (B, K)
+
+        gy = (topk_idx // W).float()
+        gx = (topk_idx % W).float()
+
+        # Extract box regression at top-K positions
+        box_flat = box_reg.view(B, 4, -1)  # (B, 4, H*W)
+        topk_box = box_flat.gather(2, topk_idx.unsqueeze(1).expand(-1, 4, -1))  # (B, 4, K)
+        topk_box = topk_box.permute(0, 2, 1)  # (B, K, 4)
+
+        # Decode boxes to normalised coords
+        cx = (gx / W + topk_box[:, :, 0]).clamp(0, 1)
+        cy = (gy / H + topk_box[:, :, 1]).clamp(0, 1)
+        bw = topk_box[:, :, 2].abs()
+        bh = topk_box[:, :, 3].abs()
+
+        x1 = (cx - bw / 2).clamp(0, 1)
+        y1 = (cy - bh / 2).clamp(0, 1)
+        x2 = (cx + bw / 2).clamp(0, 1)
+        y2 = (cy + bh / 2).clamp(0, 1)
+
+        # Use raw scores as confidence (already sigmoid)
+        boxes = torch.stack([x1, y1, x2, y2, topk_scores], dim=-1)  # (B, K, 5)
+
+        # Extract velocity at top-K positions
+        vel_flat = vel.view(B, 2, -1)
+        topk_vel = vel_flat.gather(2, topk_idx.unsqueeze(1).expand(-1, 2, -1))
+        topk_vel = topk_vel.permute(0, 2, 1)  # (B, K, 2)
+
+        return {"boxes": boxes, "velocity": topk_vel}
 
     def _draw(
         self,
@@ -180,7 +234,11 @@ class RealtimeInference:
         boxes = outputs["boxes"][0].cpu()
         vel = outputs["velocity"][0].cpu()
 
-        scores = boxes[:, 4].sigmoid()
+        # For multimodal model, scores are already sigmoided
+        if self.is_multimodal:
+            scores = boxes[:, 4]
+        else:
+            scores = boxes[:, 4].sigmoid()
         keep = scores > self.conf_thr
 
         boxes = boxes[keep]

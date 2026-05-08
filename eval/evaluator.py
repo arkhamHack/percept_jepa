@@ -90,6 +90,11 @@ class Evaluator:
             t0 = time.perf_counter()
             with torch.amp.autocast("cuda", enabled=self.amp_enabled):
                 outputs = self._forward(batch)
+
+                # Convert spatial outputs to per-object format if needed
+                if "heatmap" in outputs and "boxes" not in outputs:
+                    outputs = self._spatial_to_objects(outputs)
+
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
@@ -259,13 +264,61 @@ class Evaluator:
         return output_path
 
     def _forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return self.model(
-            image=batch["image"],
-            radar_points=batch["radar_points"],
-            radar_mask=batch["radar_mask"],
-            future_image=batch.get("future_image"),
-            agent_states=batch.get("agent_states"),
-        )
+        model = self.model
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        is_multimodal = hasattr(model, "set_training_stage")
+
+        if is_multimodal:
+            return self.model(
+                image=batch["image"],
+                radar_points=batch["radar_points"],
+                radar_mask=batch["radar_mask"],
+            )
+        else:
+            return self.model(
+                image=batch["image"],
+                radar_points=batch["radar_points"],
+                radar_mask=batch["radar_mask"],
+                future_image=batch.get("future_image"),
+                agent_states=batch.get("agent_states"),
+            )
+
+    def _spatial_to_objects(self, outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Convert anchor-free spatial outputs to legacy per-object format."""
+        heatmap = outputs["heatmap"].sigmoid()
+        box_reg = outputs["box_reg"]
+        vel = outputs["velocity"]
+
+        B, _, H, W = heatmap.shape
+        scores_flat = heatmap.view(B, -1)
+        K = min(50, scores_flat.shape[1])
+        topk_scores, topk_idx = scores_flat.topk(K, dim=1)
+
+        gy = (topk_idx // W).float()
+        gx = (topk_idx % W).float()
+
+        box_flat = box_reg.view(B, 4, -1)
+        topk_box = box_flat.gather(2, topk_idx.unsqueeze(1).expand(-1, 4, -1)).permute(0, 2, 1)
+
+        cx = (gx / W + topk_box[:, :, 0]).clamp(0, 1)
+        cy = (gy / H + topk_box[:, :, 1]).clamp(0, 1)
+        bw = topk_box[:, :, 2].abs()
+        bh = topk_box[:, :, 3].abs()
+
+        x1 = (cx - bw / 2).clamp(0, 1)
+        y1 = (cy - bh / 2).clamp(0, 1)
+        x2 = (cx + bw / 2).clamp(0, 1)
+        y2 = (cy + bh / 2).clamp(0, 1)
+
+        # Pack as [x1, y1, x2, y2, conf_logit] — use logit form for compatibility
+        conf_logit = torch.log(topk_scores / (1 - topk_scores + 1e-8))
+        boxes = torch.stack([x1, y1, x2, y2, conf_logit], dim=-1)
+
+        vel_flat = vel.view(B, 2, -1)
+        topk_vel = vel_flat.gather(2, topk_idx.unsqueeze(1).expand(-1, 2, -1)).permute(0, 2, 1)
+
+        return {"boxes": boxes, "velocity": topk_vel}
 
     @staticmethod
     def _print_results(results: dict[str, Any]) -> None:

@@ -1,35 +1,68 @@
 # ─────────────────────────────────────────────────────────────
-#  Radar-Camera Fusion JEPA — Default Configuration
+#  Radar-Camera Fusion with Pretrained V-JEPA — Default Config
 # ─────────────────────────────────────────────────────────────
 
 # Dataset
 dataset:
   nuscenes_root: "/data/nuscenes"
   version: "v1.0-mini"          # "v1.0-trainval" for full benchmark
-  image_size: [448, 800]        # (H, W)
+  image_size: [224, 224]        # (H, W) — V-JEPA expects 224x224
   max_radar_points: 256
   use_future_frame: true
 
 # Model
 model:
-  type: "jepa"
-  pretrained: true
-  light_backbone: false         # 3-block ResNet for low VRAM
-  image_feat_dim: 512
-  radar_dim: 128
+  type: "multimodal_vjepa"
+
+  # --- V-JEPA visual backbone ---
+  vjepa:
+    model_name: "vit_base_patch16_224"   # timm ViT-B/16
+    pretrained_path: null                # path to .pth, null = timm default
+    freeze: true                         # freeze entire encoder in stage 1
+    unfreeze_last_n: 0                   # >0 in stage 2 to fine-tune later blocks
+    feat_dim: 768                        # ViT-B output dim
+
+  # --- Radar BEV encoder ---
+  radar:
+    input_dim: 6                # x, y, z, vx, vy, rcs
+    bev_channels: 64            # output channels from BEV CNN
+    use_cuda_voxelize: true     # use custom CUDA bev_voxelize kernel
+
+  # --- Feature fusion ---
+  fusion:
+    type: "concat"              # concat | gated
+    fused_dim: 256              # output dim after fusion block
+
+  # --- Detection head (anchor-free) ---
+  detection:
+    feat_dim: 256
+    num_classes: 1              # objectness only for now
+
+  # --- Velocity head ---
+  velocity:
+    feat_dim: 256
+
+  # --- Tracking embeddings (optional) ---
+  tracking:
+    enabled: true
+    embed_dim: 64
+
+  # Legacy (kept for optional JEPA fine-tuning path)
   latent_dim: 256
   max_objects: 50
-  num_modes: 5                  # trajectory prediction modes
-  pred_steps: 12                # 6 seconds @ 2 Hz
-  agent_state_dim: 3            # velocity, acceleration, heading_change_rate
-  decoder_heads: 8              # attention heads in object decoder
-  decoder_layers: 2             # cross-attention layers in object decoder
+  num_modes: 5
+  pred_steps: 12
+  agent_state_dim: 3
+  decoder_heads: 8
+  decoder_layers: 2
 
 # Training
 training:
+  stage: 1                      # 1 = freeze V-JEPA, 2 = unfreeze last N
   epochs: 50
   batch_size: 4
   lr: 3.0e-4
+  backbone_lr_scale: 0.1        # multiplier for V-JEPA params in stage 2
   weight_decay: 1.0e-4
   grad_accum_steps: 4
   amp_enabled: true
@@ -38,16 +71,17 @@ training:
   checkpoint_dir: "checkpoints"
   log_interval: 50
   loss_weights:
-    jepa: 1.0
     detection: 1.0
     velocity: 0.5
+    tracking: 0.1
+    jepa: 0.0                   # 0 unless using optional JEPA path
     trajectory: 1.0
 
 # LR scheduler
 scheduler:
-  type: "cosine"                # cosine | step
-  T_max: 50                    # for cosine
-  step_size: 15                 # for step
+  type: "cosine"
+  T_max: 50
+  step_size: 15
   gamma: 0.1
 
 # Prediction
@@ -62,9 +96,9 @@ eval:
   batch_size: 8
   iou_thresholds: [0.3, 0.5, 0.7]
   dist_thresholds: [0.5, 1.0, 2.0, 4.0]
-  multi_gpu: true               # use all GPUs for eval
+  multi_gpu: true
 
-# BEV grid (for BEV model / CUDA voxelization)
+# BEV grid (for CUDA voxelization)
 bev:
   x_bounds: [-50.0, 50.0]
   y_bounds: [-50.0, 50.0]
@@ -87,7 +121,7 @@ stress_test:
 inference:
   checkpoint: "checkpoints/best.pt"
   confidence_threshold: 0.3
-  image_size: [448, 800]
+  image_size: [224, 224]
   show_velocity: true
   show_radar: true
   video_source: 0               # webcam index or video file path
