@@ -1,0 +1,157 @@
+# =============================================================================
+# Rear Camera + Rear Radar Fusion via V-JEPA Latent Representations
+# Default Configuration
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  nuscenes_root: "/path/to/nuscenes"       # path to downloaded nuScenes dataset
+  nuscenes_version: "v1.0-mini"            # use "v1.0-trainval" for full dataset
+  split: "train"                           # train / val
+  sequence_length: 4                       # number of past frames (T)
+  image_size: [224, 224]                   # H x W fed to V-JEPA
+  cameras:
+    - "CAM_BACK"                           # rear-facing camera only
+  radars:
+    - "RADAR_BACK_LEFT"
+    - "RADAR_BACK_RIGHT"
+  radar_max_points: 256                    # max radar points per sweep-accumulation
+  radar_num_sweeps: 3                      # accumulate N past radar sweeps
+  radar_features: ["x","y","z","rcs","vx_comp","vy_comp"]   # 6-D input vector
+  future_steps: 12                         # prediction horizon (K steps)
+  future_dt: 0.5                           # seconds between prediction time-steps
+  num_workers: 4
+  pin_memory: true
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  hidden_dim: 768                          # global token / embedding dimension
+
+  # --- V-JEPA visual encoder ---
+  vjepa:
+    backend: "timm_fallback"              # "timm_fallback" | "official_vjepa2"
+    backbone: "vit_base_patch16_224"       # timm model name (fallback if no pretrained weights)
+    pretrained: true                       # load ImageNet pretrained weights for backbone
+    frozen: true                           # freeze backbone during early training
+    official_model_id: ""                 # e.g. "facebook/vjepa2-vitb"
+    official_local_path: ""               # local HF-style directory with official weights
+    official_trust_remote_code: true       # needed for some official model repos
+    official_outputs_temporal_tokens: true # true for native V-JEPA2/2.1 video encoders
+    apply_temporal_on_official: false      # optional extra temporal refinement on official tokens
+    patch_size: 16
+    img_size: 224
+    temporal_depth: 2                      # extra temporal transformer layers
+    temporal_heads: 8
+    temporal_dropout: 0.1
+
+  # --- Radar encoder ---
+  radar:
+    input_dim: 6                           # x, y, z, rcs, vx_comp, vy_comp
+    pointnet_hidden: [64, 128, 256]        # MLP channel widths
+    num_radar_tokens: 64                   # K_r: cluster/aggregate to fixed token count
+    dropout: 0.1
+
+  # --- Ego motion encoder ---
+  ego:
+    input_dim: 6                           # vx, vy, ax, ay, yaw_rate, speed
+    hidden_dim: 256
+    output_dim: 768                        # project to hidden_dim
+
+  # --- Fusion transformer ---
+  fusion:
+    num_layers: 6
+    num_heads: 12
+    ffn_dim: 3072                          # 4 * hidden_dim
+    dropout: 0.1
+    attention_dropout: 0.1
+    use_cross_modal_attention: true
+
+  # --- Shared scene latent ---
+  scene_latent:
+    use_memory_tokens: false               # TODO: enable temporal memory tokens
+    memory_size: 16
+
+  # --- Detection head (DETR-style) ---
+  detection:
+    num_queries: 100                       # learnable object queries
+    num_classes: 10                        # nuScenes object classes
+    decoder_layers: 3
+    decoder_heads: 8
+    dropout: 0.1
+
+  # --- Tracking head ---
+  tracking:
+    embed_dim: 256                         # dimension of per-object track embedding
+    proj_layers: 2                         # MLP depth for embedding projection
+
+  # --- Prediction head ---
+  prediction:
+    future_steps: 12                       # must match data.future_steps
+    decoder_type: "mlp"                    # "mlp" or "transformer"
+    decoder_layers: 2
+    hidden_dim: 512
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  batch_size: 2                            # per-GPU batch size
+  num_epochs: 50
+  lr: 1.0e-4
+  backbone_lr_scale: 0.1                   # lower LR for frozen → unfrozen backbone
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  warmup_epochs: 5
+  scheduler: "cosine"                      # cosine LR annealing
+  unfreeze_backbone_epoch: 10             # epoch at which V-JEPA backbone is unfrozen
+
+  # Multi-task loss weights (λ)
+  loss_weights:
+    detection_cls: 1.0
+    detection_bbox: 5.0
+    detection_giou: 2.0
+    tracking: 0.5
+    prediction: 1.0
+
+  checkpoint_dir: "checkpoints"
+  log_dir: "runs"
+  val_interval: 5                          # validate every N epochs
+  save_interval: 10                        # save checkpoint every N epochs
+  resume: null                             # path to checkpoint to resume from
+
+# ---------------------------------------------------------------------------
+# Hardware
+# ---------------------------------------------------------------------------
+hardware:
+  device: "cuda"
+  mixed_precision: true                    # use torch.cuda.amp
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+eval:
+  nms_threshold: 0.5
+  score_threshold: 0.3
+  tracking_similarity_threshold: 0.6      # cosine sim threshold for re-id
+  max_age: 5                              # frames before track is killed
+
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+visualization:
+  output_dir: "outputs/visualizations"
+  save_attention_maps: true
+  save_bev_plots: true
+  bev_range: [-50, 50, -50, 50]           # [xmin, xmax, ymin, ymax] meters
+  palette:                                # per-class colours (RGB)
+    car:          [0, 128, 255]
+    pedestrian:   [255, 80, 80]
+    bicycle:      [80, 255, 80]
+    truck:        [255, 180, 0]
+    bus:          [180, 0, 255]
+    default:      [200, 200, 200]
